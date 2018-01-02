@@ -4749,18 +4749,116 @@ Environment* CreateEnvironment(IsolateData* isolate_data,
 }
 
 
+bool StartInspector(Environment* environment, node::NodePlatform* platform) {
+  environment->inspector_agent()->Start(platform, nullptr, node::debug_options);
+  return !node::debug_options.inspector_enabled() || environment->inspector_agent()->IsStarted();
+}
+
+void LoadEnvironmentFull(Environment* environment) {
+  environment->set_abort_on_uncaught_exception(abort_on_uncaught_exception);
+  if (force_async_hooks_checks) {
+    environment->async_hooks()->force_checks();
+  }
+
+  {
+    Environment::AsyncCallbackScope callback_scope(environment);
+    environment->async_hooks()->push_async_ids(1, 0);
+    LoadEnvironment(environment);
+    environment->async_hooks()->pop_async_id(1);
+  }
+
+  environment->set_trace_sync_io(trace_sync_io);
+}
+
+// Does this need to be pushed to the node side...???
+// Redirect function coming from
+// https://chromium.googlesource.com/chromium/src/base/+/master/process/launch_win.cc
+void RouteStdioToConsole(bool create_console_if_not_found) {
+  // Don't change anything if stdout or stderr already point to a
+  // valid stream.
+  //
+  // If we are running under Buildbot or under Cygwin's default
+  // terminal (mintty), stderr and stderr will be pipe handles.  In
+  // that case, we don't want to open CONOUT$, because its output
+  // likely does not go anywhere.
+  //
+  // We don't use GetStdHandle() to check stdout/stderr here because
+  // it can return dangling IDs of handles that were never inherited
+  // by this process.  These IDs could have been reused by the time
+  // this function is called.  The CRT checks the validity of
+  // stdout/stderr on startup (before the handle IDs can be reused).
+  // _fileno(stdout) will return -2 (_NO_CONSOLE_FILENO) if stdout was
+  // invalid.
+  if (_fileno(stdout) >= 0 || _fileno(stderr) >= 0) {
+    // _fileno was broken for SUBSYSTEM:WINDOWS from VS2010 to VS2012/2013.
+    // http://crbug.com/358267. Confirm that the underlying HANDLE is valid
+    // before aborting.
+
+    intptr_t stdout_handle = _get_osfhandle(_fileno(stdout));
+    intptr_t stderr_handle = _get_osfhandle(_fileno(stderr));
+    if (stdout_handle >= 0 || stderr_handle >= 0)
+      return;
+  }
+
+  if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
+    unsigned int result = GetLastError();
+    // Was probably already attached.
+    if (result == ERROR_ACCESS_DENIED)
+      return;
+    // Don't bother creating a new console for each child process if the
+    // parent process is invalid (eg: crashed).
+    if (result == ERROR_GEN_FAILURE)
+      return;
+    if (create_console_if_not_found) {
+      // Make a new console if attaching to parent fails with any other error.
+      // It should be ERROR_INVALID_HANDLE at this point, which means the
+      // browser was likely not started from a console.
+      AllocConsole();
+    }
+    else {
+      return;
+    }
+  }
+
+  // Arbitrary byte count to use when buffering output lines.  More
+  // means potential waste, less means more risk of interleaved
+  // log-lines in output.
+  enum { kOutputBufferSize = 64 * 1024 };
+
+  if (freopen("CONOUT$", "w", stdout)) {
+    setvbuf(stdout, nullptr, _IOLBF, kOutputBufferSize);
+    // Overwrite FD 1 for the benefit of any code that uses this FD
+    // directly.  This is safe because the CRT allocates FDs 0, 1 and
+    // 2 at startup even if they don't have valid underlying Windows
+    // handles.  This means we won't be overwriting an FD created by
+    // _open() after startup.
+    _dup2(_fileno(stdout), 1);
+  }
+  if (freopen("CONOUT$", "w", stderr)) {
+    setvbuf(stderr, nullptr, _IOLBF, kOutputBufferSize);
+    _dup2(_fileno(stderr), 2);
+  }
+
+  // Fix all cout, wcout, cin, wcin, cerr, wcerr, clog and wclog.
+  std::ios::sync_with_stdio();
+}
+
 void FreeEnvironment(Environment* env) {
   delete env;
 }
 
 
-NodePlatform* CreatePlatform(
+NodePlatform* CreateAndInitializePlatform(
   int thread_pool_size,
   uv_loop_t* loop,
   v8::TracingController* tracing_controller) {
-  return new NodePlatform(thread_pool_size, loop, tracing_controller);
-}
 
+  NodePlatform* platform = new NodePlatform(thread_pool_size, loop, tracing_controller);
+  v8::V8::InitializePlatform(platform);
+  v8::V8::Initialize();
+
+  return platform;
+}
 
 void FreePlatform(NodePlatform* platform) {
   delete platform;
